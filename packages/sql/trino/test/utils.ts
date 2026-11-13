@@ -60,7 +60,7 @@ export const layerClientFor = (server: TrinoServer, config?: Partial<TrinoClient
       )
     )
   ).pipe(Layer.provide(FetchHttpClient.layer))
-  return TrinoClient.layer({ url: coordinatorUrl(server), user: "test", ...config }).pipe(
+  return TrinoClient.layer({ url: coordinatorUrl(server), user: "test", connectTimeout: "30 seconds", ...config }).pipe(
     Layer.provideMerge(http),
     Layer.merge(Layer.succeed(RequestLog, log))
   )
