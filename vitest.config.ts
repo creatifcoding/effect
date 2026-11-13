@@ -10,6 +10,12 @@ const isNode = typeof process !== "undefined" &&
   !isBun
 const integrationTestsEnabled = process.env.EFFECT_INTEGRATION_TESTS === "1"
 // Set EFFECT_MSSQL_INTEGRATION_TESTS=0 to skip only the MSSQL integration tests.
+// The Trino suites that start servers of their own, or run long, are opt-in:
+// EFFECT_TRINO_FULL=1 runs everything; CI runs the lean subset.
+const trinoLean = integrationTestsEnabled && process.env.EFFECT_TRINO_FULL !== "1"
+const trinoFullOnly = ["Errors", "Faults", "KeepAlive", "Oracle", "Resume"].map((name) =>
+  `**/${name}.integration.test.{ts,tsx}`
+)
 const mssqlIntegrationTestsDisabled = integrationTestsEnabled && process.env.EFFECT_MSSQL_INTEGRATION_TESTS === "0"
 const clusterTestsEnabled = process.env.EFFECT_CLUSTER_TESTS === "1"
 
@@ -240,11 +246,13 @@ export default defineConfig({
       ...project("@effect/sql-sqlite-node", "packages/sql/sqlite-node", isNode || isDeno),
       ...project("@effect/sql-sqlite-react-native", "packages/sql/sqlite-react-native"),
       ...project("@effect/sql-sqlite-wasm", "packages/sql/sqlite-wasm"),
-      // One Trino coordinator serves every integration suite, started once per run, so the JVM starts once.
+      // One shared Trino coordinator serves the integration suites; suites that need
+      // their own server configuration start it themselves, one file at a time so
+      // the JVMs fit on a runner. Verified on Node and Bun only.
       ...project(
         "@effect/sql-trino",
         "packages/sql/trino",
-        true,
+        !isDeno,
         integrationTestsEnabled
           ? {
             test: {
@@ -255,7 +263,8 @@ export default defineConfig({
               }
             }
           }
-          : {}
+          : {},
+        trinoLean ? [...exclude, ...trinoFullOnly] : undefined
       ),
       ...project("@effect/ai-codegen", "packages/tools/ai-codegen", isNode),
       ...project("@effect/api-diff", "packages/tools/api-diff"),

@@ -2,15 +2,20 @@ import { TrinoClient, TrinoTypes } from "@effect/sql-trino"
 import { Context, Data, Effect, Layer } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpClient from "effect/http/HttpClient"
+import { SqlClient } from "effect/sql"
 import type { GenericContainer } from "testcontainers"
 import { inject } from "vitest"
 import { reachShared, sharedFiles, trinoContainer, type TrinoFiles, type TrinoServer } from "./coordinator.ts"
 
-export type { TrinoFiles, TrinoServer } from "./coordinator.ts"
+export { TRINO_IMAGE, TRINO_VERSION, type TrinoFiles, type TrinoServer } from "./coordinator.ts"
 
 export class ContainerError extends Data.TaggedError("ContainerError")<{
   cause: unknown
 }> {}
+
+// The community build of MinIO: quay.io/minio/minio and docker.io/minio/minio
+// are no longer pullable.
+export const MINIO_IMAGE = "pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372"
 
 /**
  * Starts a coordinator of the suite's own, configured by `options`, for suites
@@ -78,8 +83,64 @@ export class TrinoContainer extends Context.Service<TrinoContainer, TrinoServer>
   static readonly layerClient = this.layerClientWith().pipe(Layer.provideMerge(this.layer))
 }
 
-/** A layer's time budget: a JVM coordinator is shared by every suite and may be slow on a busy runner. */
-export const layerTimeout = "2 minutes"
+/**
+ * The queries a client with `X-Trino-Source: source` ran, newest first, from
+ * `system.runtime.queries`, leaving out these lookups themselves. Suites give
+ * each client a unique `source` and use it to find the coordinator's view of
+ * their statements (cancelled, still running, run twice).
+ */
+export const queriesFrom = Effect.fnUntraced(function*(source: string) {
+  const sql = yield* SqlClient.SqlClient
+  return yield* sql<{ query_id: string; state: string; error_code: string | null; query: string }>`
+    SELECT query_id, state, error_code, query FROM system.runtime.queries
+    WHERE source = ${source} AND query NOT LIKE '%system.runtime.queries%'
+    ORDER BY created DESC`
+})
+
+/**
+ * Runs `sql` with the Trino CLI inside the container and returns its output
+ * lines as text: with `JSON`, one object per row keyed by column name (read
+ * as text so number literals stay exact); with `TSV`, tab-separated values.
+ */
+export const trinoCli = (server: TrinoServer, sql: string, format: "JSON" | "TSV" = "JSON") =>
+  Effect.tryPromise({
+    try: () =>
+      server.exec([
+        // The CLI's JVM otherwise prints with the container's default charset,
+        // which mangles non-ASCII on 476.
+        "env",
+        "LANG=C.UTF-8",
+        "JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8",
+        "trino",
+        "--server",
+        "http://localhost:8080",
+        "--user",
+        "oracle",
+        "--output-format",
+        format,
+        "--execute",
+        sql
+      ]),
+    catch: (cause) => new ContainerError({ cause })
+  }).pipe(
+    Effect.flatMap((result) =>
+      result.exitCode === 0
+        ? Effect.succeed(result.stdout.split("\n").filter((line) => line.length > 0))
+        : Effect.fail(new ContainerError({ cause: new Error(`trino CLI exited ${result.exitCode}: ${result.stderr}`) }))
+    )
+  )
+
+/**
+ * `EFFECT_TRINO_FULL=1` runs every suite at full size: the suites that start servers of their own (access
+ * control, faults, resume, keep-alive, the CLI oracle) and every property run. CI runs the lean subset.
+ */
+export const FULL = process.env.EFFECT_TRINO_FULL === "1"
+
+/** A layer's time budget: generous for the full run, one a lean run fits in. */
+export const layerTimeout = FULL ? "5 minutes" : "2 minutes"
+
+/** A property's run count: `full` when `EFFECT_TRINO_FULL=1`, an eighth of it (at least 2) otherwise. */
+export const runs = (full: number) => FULL ? full : Math.max(2, Math.ceil(full / 8))
 
 /**
  * How result values decode: `default` is the pg-style decoding, `effect` the

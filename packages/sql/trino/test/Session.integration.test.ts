@@ -1,13 +1,13 @@
 import { TrinoClient } from "@effect/sql-trino"
 import { assert, it } from "@effect/vitest"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Effect, Exit, Layer, Option, Schema } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import type { Connection } from "effect/sql/SqlConnection"
-import { coordinatorUrl, layerTimeout, TrinoContainer } from "./utils.ts"
+import { coordinatorUrl, layerTimeout, runs, TrinoContainer } from "./utils.ts"
 
-// Model-based test of the client-side session: a script of
-// session-changing statements runs on one reserved connection. After every
+// Model-based test of the client-side session: generated sequences of
+// session-changing statements run on one reserved connection. After every
 // step the connection's own state, the server's view of the session (read
 // through the same connection) and a model of Trino's semantics must agree.
 
@@ -18,41 +18,28 @@ const properties = {
 } as const
 type Property = keyof typeof properties
 
-type Command =
-  | { readonly _tag: "Use"; readonly target: string }
-  | { readonly _tag: "SetSession"; readonly property: Property; readonly choice: 0 | 1 }
-  | { readonly _tag: "ResetSession"; readonly property: Property }
-  | { readonly _tag: "Prepare"; readonly name: string; readonly value: number }
-  | { readonly _tag: "Deallocate"; readonly name: string }
-  | { readonly _tag: "SetPath"; readonly path: string }
-  | { readonly _tag: "SetTimeZone"; readonly zone: string }
-  | { readonly _tag: "SetAuthorization"; readonly user: string }
-  | { readonly _tag: "ResetAuthorization" }
-  | { readonly _tag: "StartTransaction" }
-  | { readonly _tag: "Commit" }
-  | { readonly _tag: "Rollback" }
-
-// Every command once, in a state where Trino accepts it, then the ones it refuses: COMMIT outside a
-// transaction, and DEALLOCATE of a statement that is gone, which aborts the open transaction until ROLLBACK.
-const script: ReadonlyArray<Command> = [
-  { _tag: "Use", target: "tpch.tiny" },
-  { _tag: "SetSession", property: "query_max_run_time", choice: 0 },
-  { _tag: "SetSession", property: "join_distribution_type", choice: 1 },
-  { _tag: "ResetSession", property: "query_max_run_time" },
-  { _tag: "Prepare", name: "p1", value: 1 },
-  { _tag: "Deallocate", name: "p1" },
-  { _tag: "SetPath", path: "system.runtime" },
-  { _tag: "SetTimeZone", zone: "Europe/Dublin" },
-  { _tag: "SetAuthorization", user: "alice" },
-  { _tag: "ResetAuthorization" },
-  { _tag: "StartTransaction" },
-  { _tag: "Use", target: "memory.default" },
-  { _tag: "Commit" },
-  { _tag: "Commit" },
-  { _tag: "StartTransaction" },
-  { _tag: "Deallocate", name: "p1" },
-  { _tag: "Commit" }
-]
+const Command = Schema.Union([
+  Schema.TaggedStruct("Use", {
+    target: Schema.Literals(["tpch.tiny", "tpch.sf1", "memory.default", "system.runtime"])
+  }),
+  Schema.TaggedStruct("SetSession", {
+    property: Schema.Literals(["query_max_run_time", "join_distribution_type", "task_concurrency"]),
+    choice: Schema.Literals([0, 1])
+  }),
+  Schema.TaggedStruct("ResetSession", {
+    property: Schema.Literals(["query_max_run_time", "join_distribution_type", "task_concurrency"])
+  }),
+  Schema.TaggedStruct("Prepare", { name: Schema.Literals(["p1", "p2"]), value: Schema.Literals([1, 2]) }),
+  Schema.TaggedStruct("Deallocate", { name: Schema.Literals(["p1", "p2"]) }),
+  Schema.TaggedStruct("SetPath", { path: Schema.Literals(["tpch.tiny", "system.runtime"]) }),
+  Schema.TaggedStruct("SetTimeZone", { zone: Schema.Literals(["UTC", "Europe/Dublin", "America/New_York", "+05:30"]) }),
+  Schema.TaggedStruct("SetAuthorization", { user: Schema.Literals(["alice", "bob"]) }),
+  Schema.TaggedStruct("ResetAuthorization", {}),
+  Schema.TaggedStruct("StartTransaction", {}),
+  Schema.TaggedStruct("Commit", {}),
+  Schema.TaggedStruct("Rollback", {})
+])
+type Command = typeof Command.Type
 
 interface Model {
   readonly catalog: string | undefined
@@ -229,18 +216,19 @@ it.layer(TrinoContainer.layerClient.pipe(Layer.provideMerge(TrinoContainer.layer
   timeout: layerTimeout,
   excludeTestServices: true
 })("TrinoClient session", (it) => {
-  it.effect(
+  it.effect.prop(
     "keeps the client-side session equal to the server's view and to the model",
-    Effect.fnUntraced(function*() {
+    { commands: Schema.Array(Command).check(Schema.isMinLength(1), Schema.isMaxLength(8)) },
+    Effect.fnUntraced(function*({ commands }) {
       const sql = yield* TrinoClient.TrinoClient
       yield* Effect.scoped(Effect.gen(function*() {
         const conn = yield* sql.reserve
         let model = initial
         const history: Array<string> = []
         yield* Effect.gen(function*() {
-          for (const scripted of script) {
+          for (const generated of commands) {
             // An aborted transaction only takes ROLLBACK.
-            const command: Command = model.transaction === "aborted" ? { _tag: "Rollback" } : scripted
+            const command: Command = model.transaction === "aborted" ? { _tag: "Rollback" } : generated
             const statement = statementOf(command)
             history.push(statement)
             const exit = yield* Effect.exit(run(conn, statement))
@@ -267,7 +255,7 @@ it.layer(TrinoContainer.layerClient.pipe(Layer.provideMerge(TrinoContainer.layer
       assert.strictEqual(shared.properties.size, 0)
       assert.strictEqual(shared.transactionId, undefined)
     }),
-    timeout
+    { timeout, arbitrary: { runs: runs(8) } }
   )
 
   it.effect(

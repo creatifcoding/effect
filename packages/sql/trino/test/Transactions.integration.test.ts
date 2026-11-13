@@ -1,12 +1,14 @@
 import { TrinoClient } from "@effect/sql-trino"
 import { assert, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
-import { layerTimeout, TrinoContainer } from "./utils.ts"
+import { layerTimeout, runs, TrinoContainer } from "./utils.ts"
 
 // Trino's connectors write only in autocommit mode ("Catalog only supports
 // writes using autocommit"), so an explicit transaction can read and run
-// session statements but never write.
+// session statements but never write. The atomicity property is therefore:
+// autocommitted batches are visible, and writes attempted inside a
+// transaction are refused and leave nothing behind.
 
 const tableName = () => `memory.default.tx_${crypto.randomUUID().replaceAll("-", "_")}`
 
@@ -16,27 +18,51 @@ it.layer(TrinoContainer.layerClient.pipe(Layer.provideMerge(TrinoContainer.layer
   timeout: layerTimeout,
   excludeTestServices: true
 })("TrinoClient transactions", (it) => {
-  it.effect("a write inside a transaction is refused and leaves nothing behind", () =>
-    Effect.gen(function*() {
+  it.effect.prop(
+    "only autocommitted batches are visible; writes inside a transaction are refused",
+    {
+      batches: Schema.Array(Schema.Struct({
+        rows: Schema.Array(Schema.Int.check(Schema.isBetween({ minimum: -1000, maximum: 1000 }))).check(
+          Schema.isMinLength(1),
+          Schema.isMaxLength(5)
+        ),
+        inTransaction: Schema.Boolean
+      })).check(Schema.isMinLength(1), Schema.isMaxLength(5))
+    },
+    Effect.fnUntraced(function*({ batches }) {
       const sql = yield* TrinoClient.TrinoClient
       const table = tableName()
       yield* sql.unsafe(`CREATE TABLE ${table} (v integer)`)
-      yield* sql.unsafe(`INSERT INTO ${table} VALUES (1)`)
-      const exit = yield* Effect.exit(sql.withTransaction(Effect.gen(function*() {
-        // Reads inside the transaction see the autocommitted row.
-        const [count] = yield* sql.unsafe<{ n: bigint }>(`SELECT count(*) AS n FROM ${table}`)
-        assert.strictEqual(count.n, 1n)
-        yield* sql.unsafe(`INSERT INTO ${table} VALUES (2)`)
-      })))
-      assert.isTrue(Exit.isFailure(exit), "a write inside a transaction must be refused")
-      if (Exit.isFailure(exit)) {
-        assert.include(String(exit.cause), "autocommit")
-      }
-      assert.strictEqual((yield* sql.session).transactionId, undefined)
-      const rows = yield* sql.unsafe<{ v: number }>(`SELECT v FROM ${table}`)
-      assert.deepStrictEqual(rows.map((row) => row.v), [1])
-      yield* sql.unsafe(`DROP TABLE ${table}`)
-    }), timeout)
+      yield* Effect.gen(function*() {
+        const committed: Array<number> = []
+        for (const batch of batches) {
+          const insert = sql.unsafe(
+            `INSERT INTO ${table} VALUES ${batch.rows.map(() => "(?)").join(", ")}`,
+            batch.rows
+          )
+          if (!batch.inTransaction) {
+            yield* insert
+            committed.push(...batch.rows)
+            continue
+          }
+          const exit = yield* Effect.exit(sql.withTransaction(Effect.gen(function*() {
+            // Reads inside the transaction see every autocommitted row.
+            const [count] = yield* sql.unsafe<{ n: bigint }>(`SELECT count(*) AS n FROM ${table}`)
+            assert.strictEqual(count.n, BigInt(committed.length))
+            yield* insert
+          })))
+          assert.isTrue(Exit.isFailure(exit), "a write inside a transaction must be refused")
+          if (Exit.isFailure(exit)) {
+            assert.include(String(exit.cause), "autocommit")
+          }
+          assert.strictEqual((yield* sql.session).transactionId, undefined)
+        }
+        const rows = yield* sql.unsafe<{ v: number }>(`SELECT v FROM ${table} ORDER BY v`)
+        assert.deepStrictEqual(rows.map((row) => row.v), committed.sort((a, b) => a - b))
+      }).pipe(Effect.ensuring(Effect.ignore(sql.unsafe(`DROP TABLE IF EXISTS ${table}`))))
+    }),
+    { timeout, arbitrary: { runs: runs(6) } }
+  )
 
   it.effect("a failed statement aborts the transaction until it rolls back", () =>
     Effect.gen(function*() {

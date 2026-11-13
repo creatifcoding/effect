@@ -1,8 +1,9 @@
+import { TrinoClient, TrinoTypes } from "@effect/sql-trino"
 import { assert, describe, it } from "@effect/vitest"
-import { BigDecimal, DateTime, Effect, Schema } from "effect"
+import { BigDecimal, DateTime, Effect, Result, Schema } from "effect"
 import { Model } from "effect/schema"
 import { SqlClient, SqlModel, SqlResolver, SqlSchema } from "effect/sql"
-import { layerClientIn, layerTimeout } from "./utils.ts"
+import { layerClientIn, layerTimeout, TrinoContainer } from "./utils.ts"
 
 const timeout = 60_000
 
@@ -88,7 +89,7 @@ describe("Model, SqlSchema and SqlResolver on the default decoding", () => {
           assert.strictEqual(DateTime.toEpochMillis(second.executed_at), Date.UTC(2026, 10, 13, 23, 59, 59, 999))
         }), timeout)
 
-      it.effect("batches SqlResolver.findById requests", () =>
+      it.effect("batches SqlResolver.findById and SqlModel resolvers", () =>
         Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
           const tableName = yield* seed()
@@ -104,6 +105,16 @@ describe("Model, SqlSchema and SqlResolver on the default decoding", () => {
           ], { concurrency: "unbounded" })
           assertFirstTrade(first)
           assert.strictEqual(second.id, 2n)
+
+          const resolvers = yield* SqlModel.makeResolvers(Trade, {
+            tableName,
+            idColumn: "id",
+            spanPrefix: "TradeResolvers"
+          })
+          const [again] = yield* Effect.all([SqlResolver.request(1n, resolvers.findById)], {
+            concurrency: "unbounded"
+          })
+          assertFirstTrade(again)
         }), timeout)
     }
   )
@@ -135,6 +146,51 @@ describe("the types registry", () => {
           assert.strictEqual(DateTime.formatIsoDate(row.traded_on), "2026-11-12")
           assert.strictEqual(DateTime.toEpochMillis(row.executed_at), Date.UTC(2026, 10, 12, 10, 0, 0, 123))
           assert.strictEqual(DateTime.zoneToString(row.executed_tz.zone), "Europe/Dublin")
+        }), timeout)
+
+      it.effect("fails Model.Date, which expects the text of the default decoding", () =>
+        Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          const find = SqlSchema.findOne({
+            Request: Schema.Void,
+            Result: Schema.Struct({ traded_on: Model.Date }),
+            execute: () => sql`SELECT DATE '2026-11-12' AS traded_on`
+          })
+          const result = yield* Effect.result(find())
+          assert.isTrue(Result.isFailure(result))
+        }), timeout)
+    }
+  )
+
+  it.layer(
+    layerClientIn("default", {
+      types: (() => {
+        const types = TrinoTypes.makeRegistry()
+        types.register<number>("bigint", {
+          decode: (text) => Result.succeed(Number(text))
+        })
+        return types
+      })()
+    }),
+    { timeout: layerTimeout, excludeTestServices: true }
+  )("a registry with a custom codec", (it) => {
+    it.effect("applies to this client only", () =>
+      Effect.gen(function*() {
+        const sql = yield* TrinoClient.TrinoClient
+        const [row] = yield* sql<{ a: unknown; d: unknown }>`SELECT BIGINT '7' AS a, DATE '2026-11-12' AS d`
+        assert.strictEqual(row.a, 7)
+        assert.strictEqual(row.d, "2026-11-12")
+      }), timeout)
+  })
+
+  it.layer(TrinoContainer.layerClient, { timeout: layerTimeout, excludeTestServices: true })(
+    "the default registry",
+    (it) => {
+      it.effect("is unaffected by registries of other clients", () =>
+        Effect.gen(function*() {
+          const sql = yield* TrinoClient.TrinoClient
+          const [row] = yield* sql<{ a: unknown }>`SELECT BIGINT '7' AS a`
+          assert.strictEqual(row.a, 7n)
         }), timeout)
     }
   )

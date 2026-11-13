@@ -8,8 +8,15 @@ import {
 
 // Plain promises and no driver imports: globalSetup loads this module outside the test workers.
 
-/** `trinodb/trino:484`, pinned by digest. */
-export const TRINO_IMAGE = "trinodb/trino@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f"
+// `TRINO_VERSION` selects one; digests pin the image the suites run on.
+const TRINO_IMAGES = {
+  "484": "trinodb/trino@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f",
+  "476": "trinodb/trino@sha256:00125e40d063bc4816d165482f6044872b18b56026fb959d3b28ce1f96ffbbee"
+} as const
+
+export const TRINO_VERSION: keyof typeof TRINO_IMAGES = process.env.TRINO_VERSION === "476" ? "476" : "484"
+
+export const TRINO_IMAGE = TRINO_IMAGES[TRINO_VERSION]
 
 /** What the suites need from a coordinator: a started container, or the shared one reached by container id. */
 export interface TrinoServer {
@@ -33,9 +40,10 @@ export const sharedFiles: TrinoFiles = {
 export const serverStartedProbe =
   `case "$(curl -s http://localhost:8080/v1/info)" in *'"starting":false'*) true ;; *) false ;; esac`
 
-// Started is not ready: a fresh coordinator can fail its first queries with NO_NODES_AVAILABLE. Ready means a
-// query that schedules splits runs.
-const coordinatorReadyProbe = `${serverStartedProbe} && trino --execute 'SELECT count(*) FROM tpch.tiny.nation'`
+// Started is not ready: 476 fails its first queries with NO_NODES_AVAILABLE or "nodes is empty". Ready means a
+// query that schedules splits runs, or the server refuses the CLI over plain HTTP (a password-authenticated one).
+const coordinatorReadyProbe =
+  `${serverStartedProbe} && { out=$(trino --execute 'SELECT count(*) FROM tpch.tiny.nation' 2>&1) || case "$out" in *'Authentication over HTTP is not enabled'*) true ;; *) false ;; esac; }`
 
 /**
  * A coordinator that is also its only worker, ready once it runs queries. Readiness is probed inside the
@@ -44,7 +52,8 @@ const coordinatorReadyProbe = `${serverStartedProbe} && trino --execute 'SELECT 
 export const trinoContainer = (options: TrinoFiles = {}): GenericContainer =>
   new GenericContainer(TRINO_IMAGE)
     .withExposedPorts(8080)
-    // An explicit -Xmx keeps the heap inside the limit on hosts where the JVM ignores the cgroup.
+    // 476's JDK 24 ignores the cgroup limit without cgroup v2 memory delegation and is OOM-killed;
+    // an explicit -Xmx wins on every version.
     .withResourcesQuota({ memory: 2 })
     .withCopyContentToContainer([
       ...Object.entries(options.files ?? {}).map(([name, content]) => ({ content, target: `/etc/trino/${name}` })),
